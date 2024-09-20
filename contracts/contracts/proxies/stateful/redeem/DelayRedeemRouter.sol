@@ -139,6 +139,11 @@ contract DelayRedeemRouter is
      */
     uint256 public totalDebt;
 
+    /**
+     * @notice principal redeem period
+     */
+    uint256 public redeemPrincipalDelayTimestamp;
+
     receive() external payable {}
 
     /**
@@ -184,6 +189,7 @@ contract DelayRedeemRouter is
     /**
      * @notice admin-only function for modifying the value of the `redeemDelayTimestamp` variable.
      */
+    /*
     function initialize(
         address _defaultAdmin,
         address _uniBTC,
@@ -212,6 +218,17 @@ contract DelayRedeemRouter is
         _setWhitelistEnabled(_whitelistEnabled);
         _setRedeemDelayTimestamp(_redeemDelayTimestamp);
     }
+    */
+
+    /**
+     * @dev init redeemPrincipalDelayTimestamp for users claim their uniBTC
+     * use upgradeAndCall to initializeV2
+     */
+    function initializeV2(
+        uint256 _redeemPrincipalDelayTimestamp
+    ) public reinitializer(2) {
+        _setRedeemPrincipalDelayTimestamp(_redeemPrincipalDelayTimestamp);
+    }
 
     /**
      * @dev pause the contract
@@ -234,6 +251,15 @@ contract DelayRedeemRouter is
         uint256 _newValue
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         _setRedeemDelayTimestamp(_newValue);
+    }
+
+    /**
+     * @dev set a new delay principal redeem block timestamp for the contract
+     */
+    function setRedeemPrincipalDelayTimestamp(
+        uint256 _newValue
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _setRedeemPrincipalDelayTimestamp(_newValue);
     }
 
     /**
@@ -304,7 +330,7 @@ contract DelayRedeemRouter is
     }
 
     /*
-     * @dev check the address is in whitelist or not
+     * @dev check the address is in wrap-btc list or not
      */
     function isWrapBtcListed(address _token) external view returns (bool) {
         return wrapBtcList[_token];
@@ -346,7 +372,28 @@ contract DelayRedeemRouter is
     }
 
     /**
-     * @dev check the address is in whitelist or not
+     * @notice Called in order to claim delayed redeem made to msg.sender that have passed the `redeemPrincipalDelayTimestamp` period.
+     * @param maxNumberOfDelayedRedeemsToClaim Used to limit the maximum number of delayedRedeems to loop through claiming.
+     * @dev that the caller of this function can control when the funds are sent once the principal becomes claimable.
+     */
+    function claimPrincipals(
+        uint256 maxNumberOfDelayedRedeemsToClaim
+    ) external nonReentrant whenNotPaused {
+        _claimPrincipals(msg.sender, maxNumberOfDelayedRedeemsToClaim);
+    }
+
+    /**
+     * @notice Called in order to claim delayed redeem made to the caller that have passed the `redeemPrincipalDelayTimestamp` period.
+     */
+    function claimPrincipals() external nonReentrant whenNotPaused {
+        _claimPrincipals(msg.sender, type(uint256).max);
+    }
+
+    /**
+     * @notice Called in order to claim delayed redeem made to msg.sender that have passed the `redeemDelayTimestamp` period.
+     * @param maxNumberOfDelayedRedeemsToClaim Used to limit the maximum number of delayedRedeems to loop through claiming.
+     * @dev that the caller of this function cannot control where the funds are sent, but they can control when the
+     * funds are sent once the redeem becomes claimable and token comeback the contract.
      */
     function claimDelayedRedeems(
         uint256 maxNumberOfDelayedRedeemsToClaim
@@ -355,7 +402,7 @@ contract DelayRedeemRouter is
     }
 
     /**
-     * @dev check the address is in whitelist or not
+     * @notice Called in order to claim delayed redeem made to the caller that have passed the `redeemDelayTimestamp` period.
      */
     function claimDelayedRedeems() external nonReentrant whenNotPaused {
         _claimDelayedRedeems(msg.sender, type(uint256).max);
@@ -495,6 +542,15 @@ contract DelayRedeemRouter is
     }
 
     /**
+     * @notice internal function for changing the value of `redeemPrincipalDelayTimestamp`. Also performs sanity check and emits an event.
+     */
+    function _setRedeemPrincipalDelayTimestamp(uint256 newValue) internal {
+        require(newValue <= MAX_REDEEM_DELAY_DURATION_TIME, "USR012");
+        redeemPrincipalDelayTimestamp = newValue;
+        emit redeemPrincipalDelayTimestampSet(redeemDelayTimestamp, newValue);
+    }
+
+    /**
      * @notice internal function for changing the value of `whitelistEnabled`.
      */
     function _setWhitelistEnabled(bool newValue) internal {
@@ -596,6 +652,59 @@ contract DelayRedeemRouter is
     }
 
     /**
+     * @notice internal function used in both of the overloaded `claimPrincipals` functions
+     */
+    function _claimPrincipals(
+        address recipient,
+        uint256 maxNumberOfDelayedRedeemsToClaim
+    ) internal {
+        require(redeemPrincipalDelayTimestamp > redeemDelayTimestamp, "USR016");
+        uint256 delayedRedeemsCompletedBefore = _userRedeems[recipient]
+            .delayedRedeemsCompleted;
+        uint256 _userRedeemsLength = _userRedeems[recipient]
+            .delayedRedeems
+            .length;
+        uint256 numToClaim = 0;
+        uint256 amountToSend = 0;
+        while (
+            numToClaim < maxNumberOfDelayedRedeemsToClaim &&
+            (delayedRedeemsCompletedBefore + numToClaim) < _userRedeemsLength
+        ) {
+            // copy delayedRedeem from storage to memory
+            DelayedRedeem memory delayedRedeem = _userRedeems[recipient]
+                .delayedRedeems[delayedRedeemsCompletedBefore + numToClaim];
+            // check if delayedRedeem can be claimed. break the loop as soon as a delayedRedeem cannot be claimed
+            if (
+                block.timestamp <
+                delayedRedeem.timestampCreated + redeemPrincipalDelayTimestamp
+            ) {
+                break;
+            }
+            // otherwise, the delayedRedeem can be claimed, in which case we increase the amountToSend and increment numToClaim
+            amountToSend += delayedRedeem.amount;
+            // increment i to account for the delayedRedeem being claimed
+            unchecked {
+                ++numToClaim;
+            }
+        }
+
+        if (numToClaim > 0) {
+            // mark the i delayedRedeems as claimed
+            _userRedeems[recipient].delayedRedeemsCompleted =
+                delayedRedeemsCompletedBefore +
+                numToClaim;
+
+            IERC20(uniBTC).safeTransfer(msg.sender, amountToSend);
+            tokenDebts[uniBTC].claimedAmount += amountToSend;
+            emit DelayedRedeemsCompleted(
+                recipient,
+                amountToSend,
+                delayedRedeemsCompletedBefore + numToClaim
+            );
+        }
+    }
+
+    /**
      * @notice internal function for changing the value of _totalCap.
      */
     function _updateTotalCap() internal {
@@ -657,4 +766,9 @@ contract DelayRedeemRouter is
      * @notice Emitted when the `redeemDelayTimestamp` variable is modified from `previousValue` to `newValue`.
      */
     event redeemDelayTimestampSet(uint256 previousValue, uint256 newValue);
+
+    /**
+     * @notice Emitted when the `redeemPrincipalDelayTimestamp` variable is modified from `previousValue` to `newValue`.
+     */
+    event redeemPrincipalDelayTimestampSet(uint256 previousValue, uint256 newValue);
 }
